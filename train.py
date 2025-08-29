@@ -10,7 +10,7 @@ import torchvision.transforms as tfm
 
 import test
 import util
-import parser
+from args_parser import parse_arguments
 import commons
 import cosface_loss
 import augmentations
@@ -20,7 +20,7 @@ from datasets.eigenplaces_dataset import EigenPlacesDataset
 
 torch.backends.cudnn.benchmark = True  # Provides a speedup
 
-args = parser.parse_arguments()
+args = parse_arguments()
 start_time = datetime.now()
 output_folder = f"logs/{args.save_dir}/{start_time.strftime('%Y-%m-%d_%H-%M-%S')}"
 commons.make_deterministic(args.seed)
