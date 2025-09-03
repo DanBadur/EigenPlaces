@@ -22,6 +22,26 @@ torch.backends.cudnn.benchmark = True  # Provides a speedup
 
 def main():
     args = parse_arguments()
+    
+    # Validate and process device argument
+    if args.device.startswith("cuda"):
+        if ":" in args.device:
+            # Specific GPU device like "cuda:0", "cuda:1"
+            device_id = args.device.split(":")[1]
+            if not device_id.isdigit():
+                raise ValueError(f"Invalid GPU device ID: {device_id}. Must be a number.")
+            gpu_id = int(device_id)
+            if gpu_id >= torch.cuda.device_count():
+                raise ValueError(f"GPU {gpu_id} not available. Only {torch.cuda.device_count()} GPUs found.")
+            args.device = f"cuda:{gpu_id}"
+        else:
+            # Just "cuda" - use default GPU
+            args.device = "cuda"
+    elif args.device == "cpu":
+        args.device = "cpu"
+    else:
+        raise ValueError(f"Invalid device: {args.device}. Must be 'cuda', 'cpu', or 'cuda:N' where N is GPU number.")
+    
     start_time = datetime.now()
     output_folder = f"logs/{args.save_dir}/{start_time.strftime('%Y-%m-%d_%H-%M-%S')}"
     commons.make_deterministic(args.seed)

@@ -47,7 +47,7 @@ def parse_arguments():
                         "Use \"torchhub\" if you want to use one of our pretrained models")
     # Other parameters
     parser.add_argument("--device", type=str, default="cuda",
-                        choices=["cuda", "cpu"], help="_")
+                        help="Device to use: 'cuda', 'cpu', or 'cuda:0', 'cuda:1', etc. for specific GPU")
     parser.add_argument("--seed", type=int, default=0, help="_")
     parser.add_argument("--num_workers", type=int, default=8, help="_")
     parser.add_argument("--visualize_classes", type=int, default=0,
