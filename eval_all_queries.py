@@ -60,13 +60,13 @@ def generate_vpr_csv(test_ds, model, args, output_path, top_k=5):
     
     model = model.eval()
     with torch.no_grad():
-        # Extract database descriptors
+        # Extract database descriptors (process one by one to avoid size mismatch)
         logging.debug("Extracting database descriptors for CSV generation")
         database_subset_ds = torch.utils.data.Subset(test_ds, list(range(test_ds.database_num)))
         database_dataloader = torch.utils.data.DataLoader(
             dataset=database_subset_ds, 
             num_workers=args.num_workers,
-            batch_size=args.infer_batch_size, 
+            batch_size=1,  # Process one by one to avoid size mismatch
             pin_memory=(args.device == "cuda")
         )
         
@@ -76,7 +76,7 @@ def generate_vpr_csv(test_ds, model, args, output_path, top_k=5):
             descriptors = descriptors.cpu().numpy()
             all_descriptors[indices.numpy(), :] = descriptors
         
-        # Extract query descriptors
+        # Extract query descriptors (process one by one to avoid size mismatch)
         logging.debug("Extracting query descriptors for CSV generation")
         queries_subset_ds = torch.utils.data.Subset(
             test_ds, 
@@ -85,7 +85,7 @@ def generate_vpr_csv(test_ds, model, args, output_path, top_k=5):
         queries_dataloader = torch.utils.data.DataLoader(
             dataset=queries_subset_ds, 
             num_workers=args.num_workers,
-            batch_size=args.infer_batch_size, 
+            batch_size=1,  # Process one by one to avoid size mismatch
             pin_memory=(args.device == "cuda")
         )
         
