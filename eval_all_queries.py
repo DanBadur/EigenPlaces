@@ -2,6 +2,7 @@
 """
 Script to evaluate a trained EigenPlaces model on multiple query sets.
 This script will test on all query folders found in the test directory.
+Can optionally generate CSV files in VPR analysis format for visualization.
 """
 
 import sys
@@ -9,6 +10,8 @@ import torch
 import logging
 import multiprocessing
 import os
+import csv
+import numpy as np
 from datetime import datetime
 from pathlib import Path
 
@@ -32,8 +35,199 @@ def find_query_folders(test_dataset_folder):
     
     return sorted(query_folders)
 
+def extract_utm_coordinates(image_path):
+    """Extract UTM coordinates from image filename."""
+    filename = os.path.basename(image_path)
+    parts = filename.split('@')
+    if len(parts) >= 3:
+        try:
+            utm_east = float(parts[1])
+            utm_north = float(parts[2])
+            return utm_east, utm_north
+        except (ValueError, IndexError):
+            return None, None
+    return None, None
+
+def calculate_distance(utm1, utm2):
+    """Calculate Euclidean distance between two UTM coordinates."""
+    if utm1 is None or utm2 is None:
+        return float('inf')
+    return np.sqrt((utm1[0] - utm2[0])**2 + (utm1[1] - utm2[1])**2)
+
+def infer_model_architecture(model_path):
+    """Infer backbone and fc_output_dim from saved model weights."""
+    try:
+        state_dict = torch.load(model_path, map_location='cpu')
+        
+        # Infer fc_output_dim from the last linear layer
+        fc_output_dim = None
+        for key in state_dict.keys():
+            if 'aggregation.3.weight' in key:  # This is the final linear layer
+                fc_output_dim = state_dict[key].shape[0]
+                break
+        
+        if fc_output_dim is None:
+            raise ValueError("Could not infer fc_output_dim from model weights")
+        
+        # Infer backbone from the structure of the state dict
+        # Look for backbone-specific layer patterns
+        backbone = None
+        backbone_indicators = {
+            'ResNet18': ['layer1.0.conv1.weight', 'layer2.0.conv1.weight', 'layer3.0.conv1.weight', 'layer4.0.conv1.weight'],
+            'ResNet50': ['layer1.0.conv1.weight', 'layer2.0.conv1.weight', 'layer3.0.conv1.weight', 'layer4.0.conv1.weight'],
+            'ResNet101': ['layer1.0.conv1.weight', 'layer2.0.conv1.weight', 'layer3.0.conv1.weight', 'layer4.0.conv1.weight'],
+            'ResNet152': ['layer1.0.conv1.weight', 'layer2.0.conv1.weight', 'layer3.0.conv1.weight', 'layer4.0.conv1.weight'],
+            'VGG16': ['features.0.weight', 'features.2.weight', 'features.5.weight', 'features.7.weight']
+        }
+        
+        # Check which backbone pattern matches
+        for backbone_name, indicators in backbone_indicators.items():
+            if all(indicator in state_dict for indicator in indicators):
+                backbone = backbone_name
+                break
+        
+        if backbone is None:
+            # Fallback: try to infer from layer structure
+            if any('layer4' in key for key in state_dict.keys()):
+                # Has ResNet-like structure, default to ResNet18
+                backbone = 'ResNet18'
+            elif any('features' in key for key in state_dict.keys()):
+                # Has VGG-like structure
+                backbone = 'VGG16'
+            else:
+                raise ValueError("Could not infer backbone from model weights")
+        
+        return backbone, fc_output_dim
+        
+    except Exception as e:
+        raise ValueError(f"Error inferring model architecture: {str(e)}")
+
+def generate_vpr_csv(test_ds, model, args, output_path, top_k=5):
+    """Generate CSV file in VPR analysis format."""
+    logging.info(f"Generating VPR CSV for {top_k} top matches...")
+    
+    model = model.eval()
+    with torch.no_grad():
+        # Extract database descriptors
+        logging.debug("Extracting database descriptors for CSV generation")
+        database_subset_ds = torch.utils.data.Subset(test_ds, list(range(test_ds.database_num)))
+        database_dataloader = torch.utils.data.DataLoader(
+            dataset=database_subset_ds, 
+            num_workers=args.num_workers,
+            batch_size=args.infer_batch_size, 
+            pin_memory=(args.device == "cuda")
+        )
+        
+        all_descriptors = np.empty((len(test_ds), args.fc_output_dim), dtype="float32")
+        for images, indices in database_dataloader:
+            descriptors = model(images.to(args.device))
+            descriptors = descriptors.cpu().numpy()
+            all_descriptors[indices.numpy(), :] = descriptors
+        
+        # Extract query descriptors
+        logging.debug("Extracting query descriptors for CSV generation")
+        queries_subset_ds = torch.utils.data.Subset(
+            test_ds, 
+            list(range(test_ds.database_num, test_ds.database_num + test_ds.queries_num))
+        )
+        queries_dataloader = torch.utils.data.DataLoader(
+            dataset=queries_subset_ds, 
+            num_workers=args.num_workers,
+            batch_size=args.infer_batch_size, 
+            pin_memory=(args.device == "cuda")
+        )
+        
+        for images, indices in queries_dataloader:
+            descriptors = model(images.to(args.device))
+            descriptors = descriptors.cpu().numpy()
+            all_descriptors[indices.numpy(), :] = descriptors
+    
+    # Get query and database descriptors
+    queries_descriptors = all_descriptors[test_ds.database_num:]
+    database_descriptors = all_descriptors[:test_ds.database_num]
+    
+    # Find top-k matches using FAISS
+    import faiss
+    faiss_index = faiss.IndexFlatL2(args.fc_output_dim)
+    faiss_index.add(database_descriptors)
+    
+    _, predictions = faiss_index.search(queries_descriptors, top_k)
+    
+    # Generate CSV
+    csv_columns = ['query_image_path', 'utm_east', 'utm_north']
+    for i in range(1, top_k + 1):
+        csv_columns.extend([
+            f'reference_{i}_path',
+            f'reference_{i}_distance',
+            f'reference_{i}_utm_east',
+            f'reference_{i}_utm_north'
+        ])
+    
+    with open(output_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(csv_columns)
+        
+        for query_idx, preds in enumerate(predictions):
+            query_path = test_ds.queries_paths[query_idx]
+            query_utm_east, query_utm_north = extract_utm_coordinates(query_path)
+            
+            row = [query_path, query_utm_east, query_utm_north]
+            
+            for pred_idx in preds:
+                ref_path = test_ds.database_paths[pred_idx]
+                ref_utm_east, ref_utm_north = extract_utm_coordinates(ref_path)
+                
+                # Calculate distance
+                distance = calculate_distance(
+                    (query_utm_east, query_utm_north),
+                    (ref_utm_east, ref_utm_north)
+                )
+                
+                row.extend([ref_path, distance, ref_utm_east, ref_utm_north])
+            
+            writer.writerow(row)
+    
+    logging.info(f"CSV file saved to: {output_path}")
+
 def main():
-    args = parse_arguments()
+    # Add custom argument for CSV generation
+    import argparse
+    parser = argparse.ArgumentParser(description='Evaluate EigenPlaces model on multiple query sets')
+    parser.add_argument('--test_dataset_folder', type=str, required=True,
+                        help='path of the folder with test images (split in database/queries)')
+    parser.add_argument('--resume_model', type=str, required=True,
+                        help='path to best_model.pth')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='Device to use: cuda, cpu, or cuda:N')
+    parser.add_argument('--backbone', type=str, default='ResNet18',
+                        choices=['VGG16', 'ResNet18', 'ResNet50', 'ResNet101', 'ResNet152'],
+                        help='Backbone architecture (ignored if --infer_architecture is used)')
+    parser.add_argument('--fc_output_dim', type=int, default=512,
+                        help='Output dimension of final fully connected layer (ignored if --infer_architecture is used)')
+    parser.add_argument('--infer_batch_size', type=int, default=16,
+                        help='Batch size for inference')
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='Number of workers for data loading')
+    parser.add_argument('--positive_dist_threshold', type=int, default=25,
+                        help='distance in meters for a prediction to be considered a positive')
+    parser.add_argument('--save_dir', type=str, default='default',
+                        help='name of directory on which to save the logs')
+    parser.add_argument('--seed', type=int, default=0, help='Random seed')
+    
+    # CSV generation arguments
+    parser.add_argument('--generate_csv', action='store_true',
+                        help='Generate CSV files in VPR analysis format')
+    parser.add_argument('--csv_output_dir', type=str, 
+                        default='C:/Users/danba/Desktop/Git Projects/VPR_dataset_analysis',
+                        help='Directory to save CSV files')
+    parser.add_argument('--csv_top_k', type=int, default=5,
+                        help='Number of top-k matches to include in CSV')
+    
+    # Model architecture inference
+    parser.add_argument('--infer_architecture', action='store_true',
+                        help='Automatically infer backbone and fc_output_dim from saved model')
+    
+    args = parser.parse_args()
     
     # Validate required arguments
     if args.test_dataset_folder is None:
@@ -67,6 +261,14 @@ def main():
         model = torch.hub.load("gmberton/eigenplaces", "get_trained_model",
                                backbone=args.backbone, fc_output_dim=args.fc_output_dim)
     else:
+        # Infer architecture from saved model if requested
+        if args.infer_architecture and args.resume_model is not None:
+            logging.info(f"Inferring model architecture from {args.resume_model}")
+            backbone, fc_output_dim = infer_model_architecture(args.resume_model)
+            logging.info(f"Inferred: backbone={backbone}, fc_output_dim={fc_output_dim}")
+            args.backbone = backbone
+            args.fc_output_dim = fc_output_dim
+        
         model = eigenplaces_network.GeoLocalizationNet_(args.backbone, args.fc_output_dim)
         
         if args.resume_model is not None:
@@ -100,6 +302,13 @@ def main():
             }
             
             logging.info(f"{test_ds}: {recalls_str}")
+            
+            # Generate CSV if requested
+            if args.generate_csv:
+                csv_filename = f"{query_folder}_results.csv"
+                csv_path = os.path.join(args.csv_output_dir, csv_filename)
+                logging.info(f"Generating CSV for {query_folder}...")
+                generate_vpr_csv(test_ds, model, args, csv_path, args.csv_top_k)
             
         except Exception as e:
             logging.error(f"Error testing on {query_folder}: {str(e)}")
@@ -137,6 +346,17 @@ def main():
             f.write("\n")
     
     logging.info(f"\nDetailed results saved to: {results_file}")
+    
+    # Summary of CSV files if generated
+    if args.generate_csv:
+        logging.info(f"\n{'='*60}")
+        logging.info("CSV FILES GENERATED")
+        logging.info(f"{'='*60}")
+        for query_folder in query_folders:
+            if 'error' not in all_results[query_folder]:
+                csv_filename = f"{query_folder}_results.csv"
+                csv_path = os.path.join(args.csv_output_dir, csv_filename)
+                logging.info(f"{query_folder}: {csv_path}")
 
 if __name__ == '__main__':
     main()
