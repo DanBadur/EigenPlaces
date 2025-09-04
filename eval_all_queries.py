@@ -54,54 +54,6 @@ def calculate_distance(utm1, utm2):
         return float('inf')
     return np.sqrt((utm1[0] - utm2[0])**2 + (utm1[1] - utm2[1])**2)
 
-def infer_model_architecture(model_path):
-    """Infer backbone and fc_output_dim from saved model weights."""
-    try:
-        state_dict = torch.load(model_path, map_location='cpu')
-        
-        # Infer fc_output_dim from the last linear layer
-        fc_output_dim = None
-        for key in state_dict.keys():
-            if 'aggregation.3.weight' in key:  # This is the final linear layer
-                fc_output_dim = state_dict[key].shape[0]
-                break
-        
-        if fc_output_dim is None:
-            raise ValueError("Could not infer fc_output_dim from model weights")
-        
-        # Infer backbone from the structure of the state dict
-        # Look for backbone-specific layer patterns
-        backbone = None
-        backbone_indicators = {
-            'ResNet18': ['layer1.0.conv1.weight', 'layer2.0.conv1.weight', 'layer3.0.conv1.weight', 'layer4.0.conv1.weight'],
-            'ResNet50': ['layer1.0.conv1.weight', 'layer2.0.conv1.weight', 'layer3.0.conv1.weight', 'layer4.0.conv1.weight'],
-            'ResNet101': ['layer1.0.conv1.weight', 'layer2.0.conv1.weight', 'layer3.0.conv1.weight', 'layer4.0.conv1.weight'],
-            'ResNet152': ['layer1.0.conv1.weight', 'layer2.0.conv1.weight', 'layer3.0.conv1.weight', 'layer4.0.conv1.weight'],
-            'VGG16': ['features.0.weight', 'features.2.weight', 'features.5.weight', 'features.7.weight']
-        }
-        
-        # Check which backbone pattern matches
-        for backbone_name, indicators in backbone_indicators.items():
-            if all(indicator in state_dict for indicator in indicators):
-                backbone = backbone_name
-                break
-        
-        if backbone is None:
-            # Fallback: try to infer from layer structure
-            if any('layer4' in key for key in state_dict.keys()):
-                # Has ResNet-like structure, default to ResNet18
-                backbone = 'ResNet18'
-            elif any('features' in key for key in state_dict.keys()):
-                # Has VGG-like structure
-                backbone = 'VGG16'
-            else:
-                raise ValueError("Could not infer backbone from model weights")
-        
-        return backbone, fc_output_dim
-        
-    except Exception as e:
-        raise ValueError(f"Error inferring model architecture: {str(e)}")
-
 def generate_vpr_csv(test_ds, model, args, output_path, top_k=5):
     """Generate CSV file in VPR analysis format."""
     logging.info(f"Generating VPR CSV for {top_k} top matches...")
@@ -201,9 +153,9 @@ def main():
                         help='Device to use: cuda, cpu, or cuda:N')
     parser.add_argument('--backbone', type=str, default='ResNet18',
                         choices=['VGG16', 'ResNet18', 'ResNet50', 'ResNet101', 'ResNet152'],
-                        help='Backbone architecture (ignored if --infer_architecture is used)')
+                        help='Backbone architecture')
     parser.add_argument('--fc_output_dim', type=int, default=512,
-                        help='Output dimension of final fully connected layer (ignored if --infer_architecture is used)')
+                        help='Output dimension of final fully connected layer')
     parser.add_argument('--infer_batch_size', type=int, default=16,
                         help='Batch size for inference')
     parser.add_argument('--num_workers', type=int, default=8,
@@ -223,9 +175,6 @@ def main():
     parser.add_argument('--csv_top_k', type=int, default=5,
                         help='Number of top-k matches to include in CSV')
     
-    # Model architecture inference
-    parser.add_argument('--infer_architecture', action='store_true',
-                        help='Automatically infer backbone and fc_output_dim from saved model')
     
     args = parser.parse_args()
     
@@ -261,14 +210,6 @@ def main():
         model = torch.hub.load("gmberton/eigenplaces", "get_trained_model",
                                backbone=args.backbone, fc_output_dim=args.fc_output_dim)
     else:
-        # Infer architecture from saved model if requested
-        if args.infer_architecture and args.resume_model is not None:
-            logging.info(f"Inferring model architecture from {args.resume_model}")
-            backbone, fc_output_dim = infer_model_architecture(args.resume_model)
-            logging.info(f"Inferred: backbone={backbone}, fc_output_dim={fc_output_dim}")
-            args.backbone = backbone
-            args.fc_output_dim = fc_output_dim
-        
         model = eigenplaces_network.GeoLocalizationNet_(args.backbone, args.fc_output_dim)
         
         if args.resume_model is not None:
